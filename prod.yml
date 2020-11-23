@@ -1,0 +1,588 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  1S3SourceBucket:
+    Type: String
+    Default: gcs-web-2020-artifacts
+    Description: Which s3-bucket contains the artifacats?
+  2S3BackendObjectKey:
+    Type: String
+    Default: backend
+    Description: Which main-directory in the s3-bucket contains the artifacts?
+  3BackendTemplatePath:
+    Type: String
+    Default: amplify-appsync-files/c5a2fda7b69b16c3894bd8368a737676afd07dc3
+    Description: >-
+      Which subdirectory in s3-bucket/main-directory/ contains the
+      cloudformation template?
+  4BackendTemplateFileName:
+    Type: String
+    Default: cloudformation-template.json
+    Description: What is the full filename (with extension) of the cloudformation template?
+  5PollForSourceChanges:
+    Type: String
+    Default: 'true'
+    Description: >-
+      Is this true or false? Codepipeline will continuously poll s3-bucket for
+      new versions of the artifacts    
+  6NotificationEmailAddress:
+    Type: String
+    Default: anoop.madhavan@stelligent.com
+    Description: Who should receive notification emails from this pipeline?
+  7ApprovalEmailAddress:
+    Type: String
+    Default: anoop.madhavan@stelligent.com
+    Description: Who should receive approval emails from this pipeline?
+  A2S3FrontendObjectKey:
+    Type: String
+    Default: frontend
+    Description: Which main-directory in the s3-bucket contains the frontend artifacts?
+  A3S3FrontendDeploymentBucket:
+    Type: String
+    Default: prod.gcs.schneider.se.com
+    Description: Which s3-bucket is the static website in?
+  A4GraphQLApiUrlPlaceholder:
+    Type: String
+    Default: >-
+      https://ekpgiv2drvexff5wfrwr76wx4a.appsync-api.us-east-1.amazonaws.com/graphql
+    Description: GraphQL API URL Placeholder in artifacts
+  A5GraphQLApiKeyPlaceholder:
+    Type: String
+    Default: da2-wmvroegmhredpfv3xbgtttnl3y
+    Description: GraphQL API Key Placeholder in artifacts    
+Resources:
+  S3BucketForPipelineArtifacts:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-codepipeline-bucket-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !GetAtt 
+                - KMSKey
+                - Arn
+              SSEAlgorithm: 'aws:kms'
+    DependsOn:
+      - KMSKey
+  KMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Enabled: 'true'
+      EnableKeyRotation: 'false'
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: '7'
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - '*'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - '*'
+            Action:
+              - 'kms:DescribeKey'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey'
+              - 'kms:GenerateDataKeyWithoutPlaintext'
+            Resource: '*'
+  Pipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: !Sub '${AWS::StackName}-codepipeline-${AWS::AccountId}'
+      RoleArn: !GetAtt 
+        - CodePipelineRole
+        - Arn
+      ArtifactStore:
+        Location: !Ref S3BucketForPipelineArtifacts
+        Type: S3
+        EncryptionKey:
+          Id: !GetAtt 
+            - KMSKey
+            - Arn
+          Type: KMS
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: BackendSource
+              Region: us-east-1
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref 1S3SourceBucket
+                PollForSourceChanges: !Ref 5PollForSourceChanges
+                S3ObjectKey: !Sub '${2S3BackendObjectKey}.zip'
+              OutputArtifacts:
+                - Name: BackendSourceArtifacts
+              RunOrder: 1
+            - Name: FrontendSource
+              Region: !Ref 'AWS::Region'
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref 1S3SourceBucket
+                PollForSourceChanges: false
+                S3ObjectKey: !Sub '${A2S3FrontendObjectKey}.zip'
+              OutputArtifacts:
+                - Name: FrontendSourceArtifacts
+              RunOrder: 2              
+        - Name: Deploy
+          Actions:
+            - Name: BackendDeploy
+              InputArtifacts:
+                - Name: BackendSourceArtifacts            
+              Region: us-east-1
+              Namespace: BackendOutputVariables
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              OutputArtifacts: []
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !GetAtt 
+                  - CodePipelineRole
+                  - Arn
+                Capabilities: 'CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND,CAPABILITY_NAMED_IAM'
+                StackName: !Sub '${AWS::StackName}-stack-${AWS::AccountId}'
+                ParameterOverrides: !Sub >-
+                  {"S3DeploymentBucket":"${1S3SourceBucket}",
+                  "S3DeploymentRootKey":"${2S3BackendObjectKey}/${3BackendTemplatePath}"}
+                TemplatePath: !Sub 'BackendSourceArtifacts::${3BackendTemplatePath}/${4BackendTemplateFileName}'
+            - Name: ConfigureFrontend
+              InputArtifacts:
+                - Name: FrontendSourceArtifacts
+              RunOrder: 2
+              Region: !Ref 'AWS::Region'
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: InjectedArtifacts
+              Configuration:
+                EnvironmentVariables: >-
+                  [{"name":"GraphQLApiUrl","value":"#{BackendOutputVariables.GraphQLAPIEndpointOutput}","type":"PLAINTEXT"},{"name":"GraphQLApiKey","value":"#{BackendOutputVariables.GraphQLAPIIdOutput}","type":"PLAINTEXT"}]
+                ProjectName: !Ref ConfigureStageAction
+            - Name: DeployFrontend
+              InputArtifacts:
+                - Name: InjectedArtifacts
+              RunOrder: 3
+              Region: !Ref 'AWS::Region'
+              Namespace: DeployVariables
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: S3
+              OutputArtifacts: []
+              Configuration:
+                BucketName: !Ref A3S3FrontendDeploymentBucket
+                Extract: 'true'
+  ConfigureStageAction:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub '${AWS::StackName}-codepipeline-${AWS::AccountId}-configure'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |-
+          version: 0.2
+
+          phases:
+            build:
+              commands:
+                - ls
+                - sed -i -e "s~${A4GraphQLApiUrlPlaceholder}~$GraphQLApiUrl~g" ./main.js
+                - sed -i -e "s~${A4GraphQLApiUrlPlaceholder}~$GraphQLApiUrl~g" ./main.js.map
+                - sed -i -e "s~${A5GraphQLApiKeyPlaceholder}~$GraphQLApiKey~g" ./main.js
+                - sed -i -e "s~${A5GraphQLApiKeyPlaceholder}~$GraphQLApiKey~g" ./main.js.map
+          artifacts:
+            files:
+              - '**/*'
+        InsecureSsl: false
+      SecondarySourceVersions: []
+      Artifacts:
+        Type: CODEPIPELINE
+        Packaging: NONE
+        EncryptionDisabled: false
+      Cache:
+        Type: NO_CACHE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: 'aws/codebuild/amazonlinux2-x86_64-standard:3.0'
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables: []
+        PrivilegedMode: false
+        ImagePullCredentialsType: CODEBUILD
+      ServiceRole: !GetAtt 
+        - CodePipelineRole
+        - Arn
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 480
+      EncryptionKey: !GetAtt 
+        - KMSKey
+        - Arn
+      Tags: []
+      BadgeEnabled: false
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+        S3Logs:
+          Status: DISABLED
+          EncryptionDisabled: false
+    DependsOn:
+      - KMSKey
+      - CodePipelineRole                
+  CodePipelineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-codepipeline-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com                
+                - cloudformation.amazonaws.com
+                - sns.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: permissionsfortherole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+  EventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: EventRule
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+          - CodePipeline Action Execution State Change
+          - CodePipeline Stage Execution State Change
+        detail:
+          pipeline:
+            - !Sub '${AWS::StackName}-codepipeline-${AWS::AccountId}'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref NotificationSNSTopic
+          Id: PipelineNotificationTopic
+          InputTransformer:
+            InputTemplate: >-
+              "The pipeline: <pipeline>, stage: <stage> has <state>. For more
+              information
+              https://console.aws.amazon.com/codepipeline/home?region=us-east-1#/view/<pipeline>" 
+            InputPathsMap:
+              pipeline: $.detail.pipeline
+              stage: $.detail.stage
+              state: $.detail.state
+    DependsOn:
+      - NotificationSNSTopic
+  NotificationSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !Ref 6NotificationEmailAddress
+          Protocol: email
+  ApprovalSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !Ref 7ApprovalEmailAddress
+          Protocol: email
+  SNSPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument: !Sub |-
+        {
+          "Version": "2008-10-17",
+          "Id": "__default_policy_ID",
+          "Statement": [
+            {
+              "Sid": "__default_statement_ID",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "*"
+              },
+              "Action": [
+                "SNS:GetTopicAttributes",
+                "SNS:SetTopicAttributes",
+                "SNS:AddPermission",
+                "SNS:RemovePermission",
+                "SNS:DeleteTopic",
+                "SNS:Subscribe",
+                "SNS:ListSubscriptionsByTopic",
+                "SNS:Publish",
+                "SNS:Receive"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "AWS:SourceOwner": "966033364941"
+                }
+              }
+            },
+            {
+              "Sid": "event_permission",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["events.amazonaws.com","codepipeline.amazonaws.com"]
+              },
+              "Action": "sns:Publish",
+              "Resource": "*"
+            }
+          ]
+        }      
+      Topics:
+        - !Ref NotificationSNSTopic
+        - !Ref ApprovalSNSTopic
+    DependsOn:
+      - NotificationSNSTopic
+      - ApprovalSNSTopic
+      - EventRule
+  ApprovalLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt 
+        - LambdaRole
+        - Arn
+      Runtime: python3.7
+      Description: !Sub Lambda to approve stages in pipelines
+      FunctionName: !Sub '${AWS::StackName}-${AWS::AccountId}-pipelineApprovalLambda'
+      Code:
+        ZipFile: |-
+          import json
+          import logging
+          import re
+          import time
+          import boto3
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+          MAX_WAIT_FOR_RESPONSE = 10
+          WAIT_INCREMENT = 1
+
+          def handler(event, context):
+            logger.info('REQUEST RECEIVED:\n %s', event)
+            logger.info('REQUEST RECEIVED:\n %s', context)
+            pipeline = event["queryStringParameters"]['pipeline']
+            stage = event["queryStringParameters"]['stage']
+            action = event["queryStringParameters"]['action']
+            approval_action = 'transition'
+            pipelineexecutionid = event["queryStringParameters"]['pipelineexecutionid']
+            client = boto3.client('codepipeline')
+            r = client.get_pipeline_state(name=pipeline)['stageStates']
+            print(r)
+            s = next((x for x in r if x['stageName'] == stage and x['latestExecution']['pipelineExecutionId'] == pipelineexecutionid ), None)
+            print(s)
+            s1 = s['actionStates']
+            print(s1)
+            s2 = next((y for y in s1 if y['actionName'] == approval_action ), None)
+            print(s2)
+            t = s2['latestExecution']['token']
+            print(t)
+            client.put_approval_result(
+                pipelineName=pipeline,
+                stageName=stage,
+                actionName=approval_action,
+                result={
+                    'summary': 'Automatically approved by Lambda.',
+                    'status': action
+                },
+                token=t
+            )
+            logger.info("Status message: %s", client.put_approval_result)
+            if action == 'Approved':
+              return {"statusCode": 200, "body": json.dumps('Thank you for approving the release!!')}
+            elif action == 'Rejected':
+              return {"statusCode": 200, "body": json.dumps('Thank you for rejecting the release!!')}
+    DependsOn:
+      - LambdaRole
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: lambdas3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'logs:CreateLogGroup'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action: 's3:*'
+                Resource: '*'
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+  ApprovalLambdaApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      ApiKeySourceType: HEADER
+      Description: An API Gateway to integrate with pipelineApprovalLambda
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Sub '${AWS::StackName}-${AWS::AccountId}-pipelineApprovalLambda-api'
+    DependsOn:
+      - ApprovalLambda
+  ApprovalLambdaApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt 
+        - ApprovalLambdaApiGatewayRestApi
+        - RootResourceId
+      PathPart: pipeline-approval
+      RestApiId: !Ref ApprovalLambdaApiGatewayRestApi
+    DependsOn:
+      - ApprovalLambda
+  ApprovalLambdaApiGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.action: true
+        method.request.querystring.pipeline: true
+        method.request.querystring.pipelineexecutionid: true
+        method.request.querystring.stage: true
+      Integration:
+        ConnectionType: INTERNET
+        Credentials: !GetAtt 
+          - ApprovalLambdaApiGatewayIamRole
+          - Arn
+        IntegrationHttpMethod: POST
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApprovalLambda.Arn}/invocations
+      OperationName: lambda
+      ResourceId: !Ref ApprovalLambdaApiGatewayResource
+      RestApiId: !Ref ApprovalLambdaApiGatewayRestApi
+    DependsOn:
+      - ApprovalLambda
+  ApprovalLambdaApiGatewayModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      ContentType: application/json
+      RestApiId: !Ref ApprovalLambdaApiGatewayRestApi
+      Schema: {}
+    DependsOn:
+      - ApprovalLambda
+  ApprovalLambdaApiGatewayStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref ApprovalLambdaApiGatewayDeployment
+      Description: Approval Lambda API Stage v0
+      RestApiId: !Ref ApprovalLambdaApiGatewayRestApi
+      StageName: v0
+    DependsOn:
+      - ApprovalLambda
+  ApprovalLambdaApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      Description: Approval Lambda API Deployment
+      RestApiId: !Ref ApprovalLambdaApiGatewayRestApi
+    DependsOn:
+      - ApprovalLambda
+      - ApprovalLambdaApiGatewayMethod
+  ApprovalLambdaApiGatewayIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+    DependsOn:
+      - ApprovalLambda
+  ConfigLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn:
+      - ApprovalLambdaApiGatewayRestApi
+      - ApprovalLambda
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ApprovalLambda
+      Principal: apigateway.amazonaws.com
+Outputs:
+  CodePipelineUrl:
+    Value: !Sub >-
+      https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+    Description: CodePipeline URL
